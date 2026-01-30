@@ -112,6 +112,26 @@ var (
 		},
 	}
 
+	ConfigSet = CommandHelp{
+		Command:     "config-set",
+		Description: "Publish a configuration to Nacos (create or update).",
+		Parameters: []string{
+			"dataId          Required. Configuration data ID",
+			"group           Required. Configuration group name",
+			"--file, -f      Path to config file (default: read from stdin)",
+		},
+		Examples: []string{
+			"# Publish from file",
+			"config-set application.yaml DEFAULT_GROUP --file ./application.yaml",
+			"",
+			"# Publish from stdin",
+			" echo 'key: value' | nacos-cli config-set app.yaml DEFAULT_GROUP",
+			"",
+			"# Publish JSON config",
+			"config-set skill.json skill_my-skill -f ./skill.json",
+		},
+	}
+
 	SkillSync = CommandHelp{
 		Command:     "skill-sync",
 		Description: "Synchronize skills with Nacos (real-time updates).",

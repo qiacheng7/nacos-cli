@@ -60,6 +60,12 @@ func completer() *readline.PrefixCompleter {
 			readline.PcItem("--help"),
 			readline.PcItem("-h"),
 		),
+		readline.PcItem("config-set",
+			readline.PcItem("--help"),
+			readline.PcItem("-h"),
+			readline.PcItem("--file"),
+			readline.PcItem("-f"),
+		),
 		readline.PcItem("clear"),
 		readline.PcItem("server"),
 		readline.PcItem("ns"),
@@ -178,6 +184,12 @@ func (t *Terminal) handleCommand(input string) {
 		} else {
 			t.getConfig(args)
 		}
+	case "config-set":
+		if len(args) > 0 && (args[0] == "--help" || args[0] == "-h") {
+			t.showConfigSetHelp()
+		} else {
+			t.setConfig(args)
+		}
 	case "clear":
 		t.clear()
 	case "server":
@@ -213,6 +225,7 @@ func (t *Terminal) showHelp() {
 	fmt.Printf("\033[32m%-20s\033[0m %-40s %-30s\n", "config-list", "List all configurations", "config-list [options]")
 	fmt.Printf("\033[32m%-20s\033[0m %-40s %-30s\n", "", "Options: --data-id, --group, --page, --size", "")
 	fmt.Printf("\033[32m%-20s\033[0m %-40s %-30s\n", "config-get", "Get configuration content", "config-get <data-id> <group>")
+	fmt.Printf("\033[32m%-20s\033[0m %-40s %-30s\n", "config-set", "Publish config (-f file or type content)", "config-set <data-id> <group> [-f <file>]")
 	fmt.Println()
 
 	// System
@@ -552,6 +565,78 @@ func (t *Terminal) listConfigs(args []string) {
 	}
 }
 
+// setConfig publishes a configuration (interactive mode: requires --file/-f)
+func (t *Terminal) setConfig(args []string) {
+	var dataID, group, filePath string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-f" || arg == "--file" {
+			if i+1 < len(args) {
+				i++
+				filePath = args[i]
+			}
+			continue
+		}
+		if dataID == "" {
+			dataID = arg
+		} else if group == "" {
+			group = arg
+		}
+	}
+
+	if dataID == "" || group == "" {
+		fmt.Println("\033[31mUsage:\033[0m config-set <data-id> <group> [-f <file>]")
+		fmt.Println("\033[90mWithout -f: enter content in next lines, empty line to finish.\033[0m")
+		return
+	}
+
+	var content string
+	if filePath != "" {
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			fmt.Printf("\033[31mError:\033[0m read file %s: %v\n", filePath, err)
+			return
+		}
+		content = string(data)
+	} else {
+		// Read content from terminal: multi-line until empty line
+		fmt.Println("\033[90mEnter config content (empty line to finish):\033[0m")
+		var lines []string
+		for {
+			line, err := t.rl.Readline()
+			if err == readline.ErrInterrupt {
+				fmt.Println("\033[33mCancelled\033[0m")
+				return
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				fmt.Printf("\033[31mError:\033[0m %v\n", err)
+				return
+			}
+			if strings.TrimSpace(line) == "" {
+				break
+			}
+			lines = append(lines, line)
+		}
+		content = strings.Join(lines, "\n")
+	}
+
+	if content == "" {
+		fmt.Println("\033[31mError:\033[0m config content is empty (use -f <file> or type content)")
+		return
+	}
+
+	fmt.Printf("\033[90mPublishing config: \033[33m%s\033[90m (\033[33m%s\033[90m)...\033[0m\n", dataID, group)
+	if err := t.client.PublishConfig(dataID, group, content); err != nil {
+		fmt.Printf("\033[31mError:\033[0m %v\n", err)
+		return
+	}
+	fmt.Println("\033[32mConfiguration published successfully\033[0m")
+}
+
 // getConfig gets configuration content
 func (t *Terminal) getConfig(args []string) {
 	if len(args) < 2 {
@@ -602,6 +687,10 @@ func (t *Terminal) showConfigListHelp() {
 
 func (t *Terminal) showConfigGetHelp() {
 	help.ConfigGet.FormatForTerminal()
+}
+
+func (t *Terminal) showConfigSetHelp() {
+	help.ConfigSet.FormatForTerminal()
 }
 
 func (t *Terminal) showSkillSyncHelp() {

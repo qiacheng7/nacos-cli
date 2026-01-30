@@ -1,22 +1,38 @@
 package client
 
 import (
+	"crypto/hmac"
+	"crypto/sha1"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-resty/resty/v2"
 )
 
+// Auth types
+const (
+	AuthTypeNacos  = "nacos"  // username/password, token refresh
+	AuthTypeAliyun = "aliyun" // AK/SK, long-lived
+)
+
 // NacosClient represents a Nacos API client
 type NacosClient struct {
-	ServerAddr  string
-	Namespace   string
-	Username    string
-	Password    string
-	AccessToken string
-	httpClient  *resty.Client
+	ServerAddr       string
+	Namespace        string
+	AuthType         string // "nacos" or "aliyun"
+	Username         string
+	Password         string
+	AccessKey        string // Aliyun AK
+	SecretKey        string // Aliyun SK
+	AccessToken      string
+	TokenExpireAt    time.Time // from server tokenTtl (Nacos only)
+	authLoginVersion string    // "v3" or "v1", fixed after first successful login
+	httpClient       *resty.Client
 }
 
 // Config represents a Nacos configuration
@@ -43,65 +59,168 @@ type V3Response struct {
 	Data    json.RawMessage `json:"data"`
 }
 
-// NewNacosClient creates a new Nacos client
-func NewNacosClient(serverAddr, namespace, username, password string) *NacosClient {
-	// Convert empty namespace to "public"
+// NewNacosClient creates a new Nacos client. Use authType "nacos" (username/password) or "aliyun" (AK/SK).
+func NewNacosClient(serverAddr, namespace, authType, username, password, accessKey, secretKey string) *NacosClient {
 	if namespace == "" {
 		namespace = "public"
 	}
+	if authType == "" {
+		if accessKey != "" && secretKey != "" {
+			authType = AuthTypeAliyun
+		} else {
+			authType = AuthTypeNacos
+		}
+	}
 
-	client := &NacosClient{
+	c := &NacosClient{
 		ServerAddr: serverAddr,
 		Namespace:  namespace,
+		AuthType:   authType,
 		Username:   username,
 		Password:   password,
+		AccessKey:  accessKey,
+		SecretKey:  secretKey,
 		httpClient: resty.New(),
 	}
 
-	// Login to get access token
-	client.login()
-
-	return client
+	if c.AuthType == AuthTypeNacos {
+		if err := c.login(); err != nil {
+			fmt.Printf("Warning: Login failed: %v\n", err)
+		}
+	}
+	return c
 }
 
-// login authenticates with Nacos and gets an access token
+// login gets an access token. Tries v3 first, then v1; sticks to the version that succeeds.
 func (c *NacosClient) login() error {
-	resp, err := c.httpClient.R().
-		SetFormData(map[string]string{
-			"username": c.Username,
-			"password": c.Password,
-		}).
-		Post(fmt.Sprintf("http://%s/nacos/v1/auth/login", c.ServerAddr))
+	form := map[string]string{"username": c.Username, "password": c.Password}
 
+	tryV3 := c.authLoginVersion == "" || c.authLoginVersion == "v3"
+	if tryV3 {
+		u := fmt.Sprintf("http://%s/nacos/v3/auth/login", c.ServerAddr)
+		resp, err := c.httpClient.R().SetFormData(form).Post(u)
+		if err != nil {
+			if c.authLoginVersion == "v3" {
+				return fmt.Errorf("login failed: %w", err)
+			}
+		} else if resp.StatusCode() == 200 && c.applyLoginResponse(resp.Body()) {
+			c.authLoginVersion = "v3"
+			return nil
+		} else {
+			if c.authLoginVersion == "v3" {
+				return fmt.Errorf("login failed: status=%d, body=%s", resp.StatusCode(), string(resp.Body()))
+			}
+		}
+	}
+
+	// v1 login
+	u := fmt.Sprintf("http://%s/nacos/v1/auth/login", c.ServerAddr)
+	resp, err := c.httpClient.R().SetFormData(form).Post(u)
 	if err != nil {
 		return fmt.Errorf("login failed: %w", err)
 	}
-
-	if resp.StatusCode() == 200 {
-		var result map[string]interface{}
-		if err := json.Unmarshal(resp.Body(), &result); err != nil {
-			return err
-		}
-		if token, ok := result["accessToken"].(string); ok {
-			c.AccessToken = token
-		}
+	if resp.StatusCode() != 200 {
+		return fmt.Errorf("login failed: status=%d, body=%s", resp.StatusCode(), string(resp.Body()))
 	}
-
+	if !c.applyLoginResponse(resp.Body()) {
+		return fmt.Errorf("accessToken not found in login response")
+	}
+	c.authLoginVersion = "v1"
 	return nil
 }
 
-// ListConfigs retrieves a list of configurations
+// applyLoginResponse parses login JSON and sets AccessToken, TokenExpireAt. Returns true if accessToken present.
+func (c *NacosClient) applyLoginResponse(body []byte) bool {
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return false
+	}
+	token, ok := result["accessToken"].(string)
+	if !ok || token == "" {
+		return false
+	}
+	c.AccessToken = token
+	var ttlSec int64 = 0
+	switch v := result["tokenTtl"].(type) {
+	case float64:
+		ttlSec = int64(v)
+	case int:
+		ttlSec = int64(v)
+	case int64:
+		ttlSec = v
+	}
+	if ttlSec > 0 {
+		c.TokenExpireAt = time.Now().Add(time.Duration(ttlSec) * time.Second)
+	} else {
+		c.TokenExpireAt = time.Time{}
+	}
+	return true
+}
+
+// ensureTokenValid refreshes token when needed (Nacos only; Aliyun has no token).
+func (c *NacosClient) ensureTokenValid() error {
+	if c.AuthType != AuthTypeNacos {
+		return nil
+	}
+	if c.AccessToken == "" {
+		return c.login()
+	}
+	if !c.TokenExpireAt.IsZero() && time.Now().Add(5*time.Second).After(c.TokenExpireAt) {
+		return c.login()
+	}
+	return nil
+}
+
+// getSignData builds SPAS sign payload (tenant, group, timeStamp).
+func getSignData(tenant, group, timeStamp string) string {
+	if tenant == "" {
+		if group == "" {
+			return timeStamp
+		}
+		return group + "+" + timeStamp
+	}
+	if group != "" {
+		return tenant + "+" + group + "+" + timeStamp
+	}
+	return tenant + "+" + timeStamp
+}
+
+// spasSign signs data with HMAC-SHA1 + Base64 using SK.
+func spasSign(signData, secretKey string) string {
+	mac := hmac.New(sha1.New, []byte(secretKey))
+	mac.Write([]byte(signData))
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// setSpasHeaders sets Aliyun AK/SK headers: timeStamp, Spas-AccessKey, Spas-Signature.
+func (c *NacosClient) setSpasHeaders(req *resty.Request, tenant, group string) {
+	if c.AuthType != AuthTypeAliyun || c.AccessKey == "" || c.SecretKey == "" {
+		return
+	}
+	ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	req.SetHeader("timeStamp", ts)
+	req.SetHeader("Spas-AccessKey", c.AccessKey)
+	signData := getSignData(tenant, group, ts)
+	req.SetHeader("Spas-Signature", spasSign(signData, c.SecretKey))
+}
+
+// ListConfigs retrieves a list of configurations. API version is determined by authLoginVersion (v1 vs v3).
 func (c *NacosClient) ListConfigs(dataID, groupName, namespaceID string, pageNo, pageSize int) (*ConfigListResponse, error) {
-	// Use provided namespace or default to client's namespace
+	if err := c.ensureTokenValid(); err != nil {
+		return nil, err
+	}
 	ns := namespaceID
 	if ns == "" {
 		ns = c.Namespace
 	}
 
-	// Build parameters
-	params := url.Values{}
+	// 根据登录时确定的版本选择接口
+	if c.authLoginVersion == "v1" {
+		return c.listConfigsV1(dataID, groupName, ns, pageNo, pageSize)
+	}
 
-	// Enable fuzzy search only if wildcard is present
+	// v3 或未定：走 v3，非 200 直接报错
+	params := url.Values{}
 	if strings.Contains(dataID, "*") || strings.Contains(groupName, "*") {
 		params.Set("search", "blur")
 	} else {
@@ -117,71 +236,64 @@ func (c *NacosClient) ListConfigs(dataID, groupName, namespaceID string, pageNo,
 		params.Set("namespaceId", ns)
 	}
 
-	if c.AccessToken != "" {
-		params.Set("accessToken", c.AccessToken)
-	}
-
-	// Try v3 API first
 	v3URL := fmt.Sprintf("http://%s/nacos/v3/admin/cs/config/list", c.ServerAddr)
-	resp, err := c.httpClient.R().
-		SetQueryString(params.Encode()).
-		Get(v3URL)
+	req := c.httpClient.R().SetQueryString(params.Encode())
+	if c.AuthType == AuthTypeNacos && c.AccessToken != "" {
+		req.SetHeader("Authorization", fmt.Sprintf("Bearer %s", c.AccessToken))
+	}
+	c.setSpasHeaders(req, ns, groupName)
+	resp, err := req.Get(v3URL)
 
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 
-	if resp.StatusCode() == 200 {
-		var v3Resp V3Response
-		if err := json.Unmarshal(resp.Body(), &v3Resp); err != nil {
-			return nil, err
-		}
-
-		if v3Resp.Code == 0 {
-			var configList ConfigListResponse
-			if err := json.Unmarshal(v3Resp.Data, &configList); err != nil {
-				return nil, err
-			}
-			return &configList, nil
-		}
+	if resp.StatusCode() != 200 {
+		return nil, fmt.Errorf("list configs failed: status=%d, body=%s", resp.StatusCode(), string(resp.Body()))
 	}
 
-	// Fallback to v1 API if v3 fails
-	if resp.StatusCode() == 404 {
-		return c.listConfigsV1(dataID, groupName, ns, pageNo, pageSize)
+	var v3Resp V3Response
+	if err := json.Unmarshal(resp.Body(), &v3Resp); err != nil {
+		return nil, err
 	}
-
-	return nil, fmt.Errorf("list configs failed: status=%d, body=%s", resp.StatusCode(), string(resp.Body()))
+	if v3Resp.Code != 0 {
+		return nil, fmt.Errorf("list configs failed: code=%d, message=%s", v3Resp.Code, v3Resp.Message)
+	}
+	var configList ConfigListResponse
+	if err := json.Unmarshal(v3Resp.Data, &configList); err != nil {
+		return nil, err
+	}
+	return &configList, nil
 }
 
 // listConfigsV1 retrieves configs using v1 API
 func (c *NacosClient) listConfigsV1(dataID, groupName, namespace string, pageNo, pageSize int) (*ConfigListResponse, error) {
+	if err := c.ensureTokenValid(); err != nil {
+		return nil, err
+	}
 	params := url.Values{}
-
-	// Enable fuzzy search only if wildcard is present
 	if strings.Contains(dataID, "*") || strings.Contains(groupName, "*") {
 		params.Set("search", "blur")
 	} else {
 		params.Set("search", "accurate")
 	}
-
 	params.Set("dataId", dataID)
-	params.Set("group", groupName) // v1 uses 'group' instead of 'groupName'
+	params.Set("group", groupName)
 	params.Set("pageNo", fmt.Sprintf("%d", pageNo))
 	params.Set("pageSize", fmt.Sprintf("%d", pageSize))
 
 	if namespace != "" {
-		params.Set("tenant", namespace) // v1 uses 'tenant' instead of 'namespaceId'
+		params.Set("tenant", namespace)
 	}
 
-	if c.AccessToken != "" {
+	if c.AuthType == AuthTypeNacos && c.AccessToken != "" {
 		params.Set("accessToken", c.AccessToken)
 	}
 
 	v1URL := fmt.Sprintf("http://%s/nacos/v1/cs/configs", c.ServerAddr)
-	resp, err := c.httpClient.R().
-		SetQueryString(params.Encode()).
-		Get(v1URL)
+	req := c.httpClient.R().SetQueryString(params.Encode())
+	c.setSpasHeaders(req, namespace, groupName)
+	resp, err := req.Get(v1URL)
 
 	if err != nil {
 		return nil, fmt.Errorf("v1 request failed: %w", err)
@@ -201,6 +313,9 @@ func (c *NacosClient) listConfigsV1(dataID, groupName, namespace string, pageNo,
 
 // GetConfig retrieves a specific configuration
 func (c *NacosClient) GetConfig(dataID, group string) (string, error) {
+	if err := c.ensureTokenValid(); err != nil {
+		return "", err
+	}
 	params := url.Values{}
 	params.Set("dataId", dataID)
 	params.Set("group", group)
@@ -209,14 +324,14 @@ func (c *NacosClient) GetConfig(dataID, group string) (string, error) {
 		params.Set("tenant", c.Namespace)
 	}
 
-	if c.AccessToken != "" {
+	if c.AuthType == AuthTypeNacos && c.AccessToken != "" {
 		params.Set("accessToken", c.AccessToken)
 	}
 
-	url := fmt.Sprintf("http://%s/nacos/v1/cs/configs", c.ServerAddr)
-	resp, err := c.httpClient.R().
-		SetQueryString(params.Encode()).
-		Get(url)
+	apiURL := fmt.Sprintf("http://%s/nacos/v1/cs/configs", c.ServerAddr)
+	req := c.httpClient.R().SetQueryString(params.Encode())
+	c.setSpasHeaders(req, c.Namespace, group)
+	resp, err := req.Get(apiURL)
 
 	if err != nil {
 		return "", fmt.Errorf("get config failed: %w", err)
@@ -231,6 +346,9 @@ func (c *NacosClient) GetConfig(dataID, group string) (string, error) {
 
 // PublishConfig publishes a configuration
 func (c *NacosClient) PublishConfig(dataID, group, content string) error {
+	if err := c.ensureTokenValid(); err != nil {
+		return err
+	}
 	params := map[string]string{
 		"dataId":  dataID,
 		"group":   group,
@@ -241,14 +359,14 @@ func (c *NacosClient) PublishConfig(dataID, group, content string) error {
 		params["tenant"] = c.Namespace
 	}
 
-	if c.AccessToken != "" {
+	if c.AuthType == AuthTypeNacos && c.AccessToken != "" {
 		params["accessToken"] = c.AccessToken
 	}
 
-	url := fmt.Sprintf("http://%s/nacos/v1/cs/configs", c.ServerAddr)
-	resp, err := c.httpClient.R().
-		SetFormData(params).
-		Post(url)
+	apiURL := fmt.Sprintf("http://%s/nacos/v3/cs/configs", c.ServerAddr)
+	req := c.httpClient.R().SetFormData(params)
+	c.setSpasHeaders(req, c.Namespace, group)
+	resp, err := req.Post(apiURL)
 
 	if err != nil {
 		return fmt.Errorf("publish config failed: %w", err)

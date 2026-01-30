@@ -29,7 +29,7 @@ var uploadSkillCmd = &cobra.Command{
 		skillPath := args[0]
 
 		// Create Nacos client
-		nacosClient := client.NewNacosClient(serverAddr, namespace, username, password)
+		nacosClient := client.NewNacosClient(serverAddr, namespace, authType, username, password, accessKey, secretKey)
 
 		// Create skill service
 		skillService := skill.NewSkillService(nacosClient)

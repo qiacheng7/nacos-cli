@@ -28,7 +28,7 @@ var syncSkillCmd = &cobra.Command{
 		// Handle --all flag
 		if syncAllSkills {
 			// Create Nacos client to fetch all skills
-			nacosClient := client.NewNacosClient(serverAddr, namespace, username, password)
+			nacosClient := client.NewNacosClient(serverAddr, namespace, authType, username, password, accessKey, secretKey)
 			skillService := skill.NewSkillService(nacosClient)
 
 			fmt.Println("Fetching list of all skills...")
@@ -56,7 +56,7 @@ var syncSkillCmd = &cobra.Command{
 		}
 
 		// Create Nacos client
-		nacosClient := client.NewNacosClient(serverAddr, namespace, username, password)
+		nacosClient := client.NewNacosClient(serverAddr, namespace, authType, username, password, accessKey, secretKey)
 
 		// Create skill syncer
 		skillSyncer := sync.NewSkillSyncer(nacosClient, "")

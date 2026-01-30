@@ -21,7 +21,7 @@ var listSkillCmd = &cobra.Command{
 	Long:  help.SkillList.FormatForCLI("nacos-cli"),
 	Run: func(cmd *cobra.Command, args []string) {
 		// Create Nacos client
-		nacosClient := client.NewNacosClient(serverAddr, namespace, username, password)
+		nacosClient := client.NewNacosClient(serverAddr, namespace, authType, username, password, accessKey, secretKey)
 
 		// Create skill service
 		skillService := skill.NewSkillService(nacosClient)
