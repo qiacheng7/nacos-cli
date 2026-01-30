@@ -97,17 +97,16 @@ func (c *NacosClient) login() error {
 
 	tryV3 := c.authLoginVersion == "" || c.authLoginVersion == "v3"
 	if tryV3 {
-		u := fmt.Sprintf("http://%s/nacos/v3/auth/login", c.ServerAddr)
+		u := fmt.Sprintf("http://%s/nacos/v3/auth/user/login", c.ServerAddr)
 		resp, err := c.httpClient.R().SetFormData(form).Post(u)
-		if err != nil {
-			if c.authLoginVersion == "v3" {
-				return fmt.Errorf("login failed: %w", err)
-			}
-		} else if resp.StatusCode() == 200 && c.applyLoginResponse(resp.Body()) {
+		if resp.StatusCode() == 200 && c.applyLoginResponse(resp.Body()) {
 			c.authLoginVersion = "v3"
 			return nil
 		} else {
-			if c.authLoginVersion == "v3" {
+			if err != nil {
+				return fmt.Errorf("login failed: %w", err)
+			}
+			if resp.StatusCode() != 200 {
 				return fmt.Errorf("login failed: status=%d, body=%s", resp.StatusCode(), string(resp.Body()))
 			}
 		}
