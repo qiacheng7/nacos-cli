@@ -99,32 +99,25 @@ func (c *NacosClient) login() error {
 	if tryV3 {
 		u := fmt.Sprintf("http://%s/nacos/v3/auth/user/login", c.ServerAddr)
 		resp, err := c.httpClient.R().SetFormData(form).Post(u)
-		if resp.StatusCode() == 200 && c.applyLoginResponse(resp.Body()) {
+		if resp != nil && resp.StatusCode() == 200 && c.applyLoginResponse(resp.Body()) {
 			c.authLoginVersion = "v3"
-			return nil
-		} else {
-			if err != nil {
-				return fmt.Errorf("login failed: %w", err)
-			}
-			if resp.StatusCode() != 200 {
-				return fmt.Errorf("login failed: status=%d, body=%s", resp.StatusCode(), string(resp.Body()))
-			}
+		} else if err != nil {
+			fmt.Printf("v3 login failed: %w", err)
+		} else if resp != nil && resp.StatusCode() != 200 {
+			fmt.Printf("v3 login failed: status=%d, body=%s", resp.StatusCode(), string(resp.Body()))
 		}
 	}
 
 	// v1 login
 	u := fmt.Sprintf("http://%s/nacos/v1/auth/login", c.ServerAddr)
 	resp, err := c.httpClient.R().SetFormData(form).Post(u)
-	if err != nil {
-		return fmt.Errorf("login failed: %w", err)
+	if resp != nil && resp.StatusCode() == 200 && c.applyLoginResponse(resp.Body()) {
+		c.authLoginVersion = "v1"
+	} else if err != nil {
+		fmt.Printf("v1 login failed: %w", err)
+	} else if resp != nil && resp.StatusCode() != 200 {
+		fmt.Printf("v1 login failed: status=%d, body=%s", resp.StatusCode(), string(resp.Body()))
 	}
-	if resp.StatusCode() != 200 {
-		return fmt.Errorf("login failed: status=%d, body=%s", resp.StatusCode(), string(resp.Body()))
-	}
-	if !c.applyLoginResponse(resp.Body()) {
-		return fmt.Errorf("accessToken not found in login response")
-	}
-	c.authLoginVersion = "v1"
 	return nil
 }
 
